@@ -506,6 +506,11 @@ func (s *Service) Rotate(id string, req RotateRequest) (CycleView, error) {
 		if !snap.Compatible(req.FromZoneID, req.ToZoneID) {
 			return NewError(CodeInvalidTransition, "zones incompatible")
 		}
+		// The colony must actually occupy the declared source zone; otherwise a
+		// mismatched from-zone would silently release the colony's real occupancy.
+		if occupancy.SourceOccupancies(st.Occupancies[id], req.ColonyID, req.FromZoneID) == nil {
+			return NewError(CodeInvalidTransition, "rotation source mismatch: colony not in "+req.FromZoneID)
+		}
 		var others []occupancy.WindowOccupancy
 		for _, o := range st.Occupancies[id] {
 			if o.ColonyID != req.ColonyID {
@@ -537,10 +542,12 @@ func (s *Service) Rotate(id string, req RotateRequest) (CycleView, error) {
 			return NewError(CodeInvalidTransition, "insufficient budget for rotation")
 		}
 
-		// Release old occupancies for the colony, then establish the new one.
+		// Release the colony's occupancies in the declared source zone, then
+		// establish the new one. Occupancies the colony holds in other zones
+		// (or windows unrelated to this rotation) are left untouched.
 		var kept []occupancy.WindowOccupancy
 		for _, o := range st.Occupancies[id] {
-			if o.ColonyID == req.ColonyID {
+			if o.ColonyID == req.ColonyID && o.ZoneID == req.FromZoneID {
 				continue
 			}
 			kept = append(kept, o)
