@@ -112,6 +112,8 @@ func (s *Service) Observe(id string, req ObservationRequest) (ObservationResult,
 	}
 	var result ObservationResult
 	var replay []byte
+	var quarantineErr error
+	var quarantineEvent cycle.EvidenceEvent
 	err = s.store.Update(func(st *store.State) error {
 		if rec, ok := st.Operations[req.OperationID]; ok {
 			if rec.Digest != digest {
@@ -139,17 +141,27 @@ func (s *Service) Observe(id string, req ObservationRequest) (ObservationResult,
 			return NewError(CodeInvalidRequest, "observation generation mismatch")
 		}
 
-		// Freeze barrier check.
+		// Freeze barrier check. A frozen observation must fail per the barrier
+		// version, but its quarantine evidence is an append-only audit record that
+		// must persist even though the operation is rejected: the evidence stream
+		// and the recovery evidence root both have to include it, even after a
+		// restart. Because Update rolls back every mutation when the callback
+		// returns an error, the quarantine event cannot be appended here — it is
+		// committed in a dedicated transaction after this one rolls back. Return a
+		// sentinel so this transaction leaves no partial business state, while the
+		// caller commits the evidence separately and surfaces the rejection.
+		frozen := false
 		for _, b := range st.Barriers[id] {
 			if b.Affects(req.ZoneID, req.LogicalTime) {
-				ev := cycle.NewEvent(id, cycle.EvidenceQuarantine, req.LogicalTime, effectiveGen, digest, "frozen zone")
-				ev.Seq = c.EvidenceSeq + 1
-				c.EvidenceSeq = ev.Seq
-				st.Evidence[id] = append(st.Evidence[id], ev)
-				st.Cycles[id] = c
-				result = ObservationResult{Status: "quarantine"}
-				return NewError(CodeInvalidTransition, "zone frozen")
+				frozen = true
+				break
 			}
+		}
+		if frozen {
+			result = ObservationResult{Status: "quarantine"}
+			quarantineErr = NewError(CodeInvalidTransition, "zone frozen")
+			quarantineEvent = cycle.NewEvent(id, cycle.EvidenceQuarantine, req.LogicalTime, effectiveGen, digest, "frozen zone")
+			return errQuarantineCommit
 		}
 
 		obs := coverage.Observation{
@@ -240,6 +252,29 @@ func (s *Service) Observe(id string, req ObservationRequest) (ObservationResult,
 		st.Operations[req.OperationID] = cycle.OperationRecord{OperationID: req.OperationID, Digest: digest, Response: string(resp), AppliedAt: req.LogicalTime}
 		return nil
 	})
+	if err == errQuarantineCommit {
+		// The observation was rejected by a freeze barrier. The rejection itself
+		// carries no business mutation, so the outer transaction was rolled back
+		// on purpose. The quarantine evidence, however, is an append-only audit
+		// record that must survive: commit it in its own transaction so that the
+		// evidence stream and root digest include the frozen observation even
+		// after a restart.
+		if commitErr := s.store.Update(func(st *store.State) error {
+			c, ok := st.Cycles[id]
+			if !ok {
+				return NewError(CodeNotFound, "cycle not found")
+			}
+			quarantineEvent.Seq = c.EvidenceSeq + 1
+			c.EvidenceSeq = quarantineEvent.Seq
+			st.Evidence[id] = append(st.Evidence[id], quarantineEvent)
+			c.EvidenceRoot = cycle.EvidenceRoot(st.Evidence[id])
+			st.Cycles[id] = c
+			return nil
+		}); commitErr != nil {
+			return ObservationResult{}, commitErr
+		}
+		return result, quarantineErr
+	}
 	if err != nil {
 		return ObservationResult{}, err
 	}
@@ -248,6 +283,18 @@ func (s *Service) Observe(id string, req ObservationRequest) (ObservationResult,
 	}
 	return result, nil
 }
+
+// errQuarantineCommit is a sentinel returned from the observation transaction
+// when a frozen observation must be rejected but its quarantine evidence must
+// still be committed. It is intercepted by Observe and never surfaced to the
+// caller.
+var errQuarantineCommit = newQuarantineSentinel()
+
+type quarantineSentinel struct{}
+
+func newQuarantineSentinel() error { return &quarantineSentinel{} }
+
+func (e *quarantineSentinel) Error() string { return "quarantine evidence commit pending" }
 
 func (s *Service) computeDerived(req ObservationRequest) ([]DerivedMetricView, error) {
 	rr, err := coverage.ReturnRate(req.ReturningBees, req.OutgoingBees)
