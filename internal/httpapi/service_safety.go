@@ -179,8 +179,14 @@ func (s *Service) RecoveryCheck(id string, req RecoveryCheckRequest) (RecoveryCh
 }
 
 func (s *Service) findOrCreateCredential(st *store.State, id string, gen int64) safety.RecoveryCredential {
-	if len(st.RecoveryCredentials[id]) > 0 {
-		return st.RecoveryCredentials[id][0]
+	// A late pesticide event bumps RecoveryGen and invalidates every prior
+	// credential for that generation. Recovery must therefore be authorized by a
+	// fresh credential for the current, non-invalidated generation; reusing a
+	// stale (invalidated) credential would leave the cycle stuck in safety_frozen.
+	for _, c := range st.RecoveryCredentials[id] {
+		if c.RecoveryGen == gen && c.InvalidatedByGen == 0 {
+			return c
+		}
 	}
 	return safety.RecoveryCredential{ID: fmt.Sprintf("%s:cred:%d", id, gen), CycleID: id, RecoveryGen: gen}
 }
