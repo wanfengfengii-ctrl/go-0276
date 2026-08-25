@@ -159,6 +159,9 @@ func saveState(tx *sql.Tx, s *State) error {
 	if err = saveSlice(tx, "evidence", "cycle_id", s.Evidence); err != nil {
 		return err
 	}
+	if err = saveMap(tx, "operations", "operation_id", s.Operations); err != nil {
+		return err
+	}
 	if err = saveSlice(tx, "pesticides", "cycle_id", s.Pesticides); err != nil {
 		return err
 	}
