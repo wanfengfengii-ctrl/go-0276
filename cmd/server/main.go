@@ -37,7 +37,13 @@ func main() {
 			log.Fatalf("open store: %v", err)
 		}
 	}
-	st.Close()
+	// The store must stay open for the entire lifetime of the process: the
+	// recovery scan and every request handler transact against it. Closing it
+	// here would make View/Update fail with "database is closed", so HTTP 200
+	// health checks would silently report an empty state while every write
+	// (POST /v1/cycles) and read (GET /v1/cycles/{id}) returned 500. Defer the
+	// close so the handle is released only when the server is shutting down.
+	defer st.Close()
 
 	report := recoverReport(st)
 	if len(report) > 0 {
