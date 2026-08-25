@@ -82,14 +82,19 @@ func NewMemoryStore() *DB {
 }
 
 // Update runs fn against the current state, rolling back all mutations when fn
-// returns an error.
+// returns an error so that a failed transaction leaves no partial state — the
+// same all-or-nothing contract the SQL backend provides. Snapshotting happens
+// before fn runs; restoring the snapshot on error discards every mutation fn
+// made, including mutations to maps and slices reached through the State value.
 func (db *DB) Update(fn func(*State) error) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	if db.closed {
 		return ErrClosed
 	}
+	snapshot := cloneState(db.state)
 	if err := fn(db.state); err != nil {
+		db.state = snapshot
 		return err
 	}
 	return nil
@@ -119,6 +124,57 @@ var ErrClosed = &dbClosedError{}
 type dbClosedError struct{}
 
 func (e *dbClosedError) Error() string { return "store: database closed" }
+
+// cloneState returns an independent deep copy of s so that mutating the copy's
+// maps or the slices reachable through it cannot affect the original. Value
+// maps are copied element-wise (the values are copied by assignment); slice
+// maps additionally get a fresh backing array per slice so appends into the copy
+// cannot retroactively alter the original's slice. This is what makes the
+// in-memory transaction snapshot safe to restore after a failed Update.
+func cloneState(s *State) *State {
+	c := &State{
+		Version:             s.Version,
+		Cycles:              cloneValueMap(s.Cycles),
+		Configs:             cloneValueMap(s.Configs),
+		Snapshots:           cloneValueMap(s.Snapshots),
+		Occupancies:         cloneSliceMap(s.Occupancies),
+		Budgets:             cloneValueMap(s.Budgets),
+		CoverageCells:       cloneValueMap(s.CoverageCells),
+		Evidence:            cloneSliceMap(s.Evidence),
+		Operations:          cloneValueMap(s.Operations),
+		Pesticides:          cloneSliceMap(s.Pesticides),
+		Barriers:            cloneSliceMap(s.Barriers),
+		RecoveryCredentials: cloneSliceMap(s.RecoveryCredentials),
+		Reviews:             cloneSliceMap(s.Reviews),
+		DeviceCalls:         cloneValueMap(s.DeviceCalls),
+		RetryAttempts:       cloneSliceMap(s.RetryAttempts),
+		Terminals:           cloneValueMap(s.Terminals),
+	}
+	return c
+}
+
+// cloneValueMap returns a copy of m with the same key/value entries. The value
+// type T must be a pure value type (no pointer or slice fields that callers
+// mutate in place); the structs stored in State satisfy this.
+func cloneValueMap[T any](m map[string]T) map[string]T {
+	out := make(map[string]T, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
+}
+
+// cloneSliceMap returns a copy of m where each slice has a fresh backing array,
+// so an append into the copy cannot mutate the original's slice header or its
+// underlying array.
+func cloneSliceMap[T any](m map[string][]T) map[string][]T {
+	out := make(map[string][]T, len(m))
+	for k, v := range m {
+		dup := append([]T(nil), v...)
+		out[k] = dup
+	}
+	return out
+}
 
 // CellKey builds the map key for a coverage cell from its identity components.
 func CellKey(cycleID, zoneID, batchID string, point int64) string {
