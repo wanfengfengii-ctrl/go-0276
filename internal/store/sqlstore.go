@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"sort"
+	"sync"
 
 	_ "modernc.org/sqlite" // registers the "sqlite" database/sql driver
 
@@ -18,22 +19,45 @@ import (
 // the data model is stored as a normalized SQL table with a primary key, and all
 // writes run inside a single database transaction so that a crash or error
 // leaves either the complete before-state or the complete after-state.
+//
+// Because saveState rewrites every table from a snapshot loaded at the start
+// of the transaction, two concurrent updates would each load a stale snapshot
+// and the later commit would silently overwrite the earlier one (a lost update:
+// cycles created by the first writer vanish). Worse, SQLite's default
+// busy_timeout is zero, so a second concurrent write transaction fails
+// immediately with SQLITE_BUSY. The write mutex serializes updates so each
+// transaction loads the latest committed state, mirroring the in-memory DB;
+// the read mutex guards Views against a racing commit.
 type SQLStore struct {
-	db *sql.DB
+	writeMu sync.Mutex
+	db      *sql.DB
 }
 
 // OpenSQLStore opens (or initializes) a SQLite database at path, applying any
 // pending migrations and leaving an empty database ready for use when the file
 // does not yet exist. An empty path selects an in-memory database.
+//
+// The connection is configured for safe concurrent use: a busy timeout so a
+// writer briefly waits for a lock instead of failing, and WAL journaling so
+// readers do not block writers and writers do not block readers.
 func OpenSQLStore(path string) (*SQLStore, error) {
 	dsn := path
 	if dsn == "" {
 		dsn = ":memory:"
+	} else {
+		// file:mode ties WAL to the file itself so reopening keeps the mode.
+		dsn = "file:" + dsn + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)"
 	}
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
 	}
+	// Pin the pool to one connection. For ":memory:" each connection owns a
+	// separate private database, so a second pooled connection would see an
+	// empty schema and silently drop writes; capping to one keeps every
+	// transaction on the same migrated database. It also makes the writeMutex
+	// the single arbiter of access for file-backed databases.
+	db.SetMaxOpenConns(1)
 	if err := applyMigrations(db); err != nil {
 		db.Close()
 		return nil, err
@@ -42,8 +66,13 @@ func OpenSQLStore(path string) (*SQLStore, error) {
 }
 
 // Update runs fn inside a single database transaction. On error the transaction
-// is rolled back and no partial state is persisted.
+// is rolled back and no partial state is persisted. Updates are serialized so
+// each transaction reads the latest committed state and commits cannot race,
+// which prevents the lost-update that full-table rewrites would otherwise cause
+// under concurrency.
 func (s *SQLStore) Update(fn func(*State) error) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
@@ -64,8 +93,12 @@ func (s *SQLStore) Update(fn func(*State) error) error {
 	return tx.Commit()
 }
 
-// View loads the current state and runs fn read-only against it.
+// View loads the current state and runs fn read-only against it. The write mutex
+// is held so a View cannot observe a half-written snapshot torn by a racing
+// commit (which rewrites every table).
 func (s *SQLStore) View(fn func(*State) error) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	state, err := loadState(s.db)
 	if err != nil {
 		return err
