@@ -22,6 +22,22 @@ func (b FreezeBarrier) Affects(zoneID string, at int64) bool {
 	return false
 }
 
+// Lifted reports whether the freeze barrier has been recovered and no longer
+// blocks cycle close. A barrier is lifted once a ready recovery credential
+// exists for its recovery generation, or for any later generation: a late
+// pesticide event supersedes earlier freezes (invalidating their credentials and
+// bumping the recovery generation), so recovering the latest generation lifts
+// every prior barrier as well. Barriers whose generation has not yet been
+// recovered keep blocking close.
+func (b FreezeBarrier) Lifted(credentials []RecoveryCredential) bool {
+	for _, c := range credentials {
+		if c.RecoveryGen >= b.RecoveryGen && c.Ready() {
+			return true
+		}
+	}
+	return false
+}
+
 // PropagateFreeze computes the affected zones from an applied zone, a drift
 // adjacency graph and the number of drift layers. It returns the applied zone
 // plus every zone reachable within the given number of adjacency hops.

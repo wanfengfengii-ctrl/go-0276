@@ -463,9 +463,11 @@ func (s *Service) checkClosePreconditions(st *store.State, id string) error {
 	if !acct.Conserved() {
 		return NewError(CodeInvalidTransition, "budget not conserved")
 	}
+	credentials := st.RecoveryCredentials[id]
 	for _, b := range st.Barriers[id] {
-		_ = b
-		return NewError(CodeInvalidTransition, "active freeze barrier")
+		if !b.Lifted(credentials) {
+			return NewError(CodeInvalidTransition, "active freeze barrier")
+		}
 	}
 	c := st.Cycles[id]
 	if c.State == cycle.StateSupplementing {
